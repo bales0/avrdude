@@ -784,6 +784,8 @@ retry:
 static int stk500v2_command(const PROGRAMMER *pgm, unsigned char *buf, size_t len, size_t maxlen) {
   int tries = 0;
   int status;
+  const unsigned char command = buf[0];
+  const unsigned char subcommand = len > 1? buf[1]: 0;
 
   DEBUG("STK500V2: stk500v2_command(");
   for(size_t i = 0; i < len; i++)
@@ -806,8 +808,22 @@ retry:
   // If we got a successful readback, return
   if(status > 0) {
     DEBUG(" = %d\n", status);
-    if(status < 2) {
+    // Serial recv counts the five-byte header and checksum; USB recv does
+    // not. JTAG wrappers include their one-byte envelope in the return count.
+    const int reply_size = status -
+      ((my.pgmtype == PGMTYPE_AVRISP_MKII || my.pgmtype == PGMTYPE_STK600)? 0:
+       (my.pgmtype == PGMTYPE_JTAGICE_MKII || my.pgmtype == PGMTYPE_JTAGICE3)? 1: 6);
+
+    if(reply_size < 2) {
       pmsg_error("short reply\n");
+      return -1;
+    }
+    if(buf[0] != command) {
+      pmsg_error("unexpected reply opcode 0x%02x (expected 0x%02x)\n", buf[0], command);
+      return -1;
+    }
+    if(buf[0] == CMD_XPROG && (reply_size < 3 || buf[1] != subcommand)) {
+      pmsg_error("short or mismatched XPROG reply\n");
       return -1;
     }
     if(buf[0] == CMD_XPROG_SETMODE || buf[0] == CMD_XPROG) {
@@ -838,6 +854,10 @@ retry:
           break;
         }
         pmsg_error("%s: %s\n", buf[0] == CMD_XPROG_SETMODE? "CMD_XPROG_SETMODE": "CMD_XPROG", msg);
+        return -1;
+      }
+      if(command == CMD_XPROG && (size_t) reply_size != maxlen) {
+        pmsg_error("short XPROG payload: got %d bytes, expected %u\n", reply_size, (unsigned) maxlen);
         return -1;
       }
       return 0;
@@ -882,6 +902,13 @@ retry:
     }
   }
 
+  // A missing XPROG acknowledgement is an indeterminate operation. Never
+  // report successful resynchronisation as successful programming, or replay
+  // a potentially completed erase/write.
+  if(command == CMD_XPROG || command == CMD_XPROG_SETMODE) {
+    pmsg_error("XPROG transport failed; command completion is unknown\n");
+    return -1;
+  }
   // Otherwise try to sync up again
   status = stk500v2_getsync(pgm);
   if(status != 0) {
@@ -892,8 +919,8 @@ retry:
       goto retry;
   }
 
-  DEBUG(" = 0\n");
-  return 0;
+  pmsg_error("command was not acknowledged after resynchronisation\n");
+  return -1;
 }
 
 static int stk500v2_cmd(const PROGRAMMER *pgm, const unsigned char *cmd, unsigned char *res) {
@@ -1157,8 +1184,13 @@ static int stk500v2_initialize(const PROGRAMMER *pgm, const AVRPART *p) {
   LNODEID ln;
   AVRMEM *m;
 
+  if(my.pgmtype == PGMTYPE_STK500 && (is_pdi(p) || is_tpi(p)) && !my.xprog_supported) {
+    pmsg_error("this STK500 did not accept XPROG mode selection; PDI/TPI is unavailable\n");
+    return -1;
+  }
+
   if((my.pgmtype == PGMTYPE_STK600 ||
-      my.pgmtype == PGMTYPE_STK500 ||
+      (my.pgmtype == PGMTYPE_STK500 && my.xprog_supported) ||
       my.pgmtype == PGMTYPE_AVRISP_MKII ||
       my.pgmtype == PGMTYPE_JTAGICE_MKII) != 0 && (p->prog_modes & (PM_PDI | PM_TPI)) != 0) {
     // This is an ATxmega device, must use XPROG protocol for the remaining actions
@@ -1704,10 +1736,19 @@ static void stk500hvsp_disable(const PROGRAMMER *pgm) {
 }
 
 static void stk500v2_enable(PROGRAMMER *pgm, const AVRPART *p) {
+  // Probe only when the selected target actually needs XPROG. SETMODE
+  // selects a protocol; it does not enter programming mode or switch power.
+  my.xprog_supported = false;
+  if(pgm->initialize == stk500v2_initialize && my.pgmtype == PGMTYPE_STK500 &&
+      (is_pdi(p) || is_tpi(p))) {
+    unsigned char probe[2] = {CMD_XPROG_SETMODE, is_tpi(p)? XPRG_MODE_TPI: XPRG_MODE_PDI};
+
+    my.xprog_supported = stk500v2_command(pgm, probe, 2, sizeof(probe)) == 0;
+  }
   // Previously stk500v2_initialize() set up pgm
   if(pgm->initialize == stk500v2_initialize) {
     if((my.pgmtype == PGMTYPE_STK600 ||
-        my.pgmtype == PGMTYPE_STK500 ||
+        (my.pgmtype == PGMTYPE_STK500 && my.xprog_supported) ||
         my.pgmtype == PGMTYPE_AVRISP_MKII ||
         my.pgmtype == PGMTYPE_JTAGICE_MKII) != 0 && (p->prog_modes & (PM_PDI | PM_TPI)) != 0) {
       stk600_setup_xprog(pgm);
@@ -4573,8 +4614,8 @@ static int stk600_xprog_paged_write(const PROGRAMMER *pgm, const AVRPART *p, con
   unsigned char writemode;
 
   // The XPROG read command supports at most 256 bytes in one transfer
-  if(page_size > 512) {
-    pmsg_error("cannot handle page size > 512\n");
+  if(!page_size || page_size > 512 || (page_size & (page_size - 1))) {
+    pmsg_error("XPROG page size must be a power of two between 1 and 512\n");
     return -1;
   }
 
@@ -4637,84 +4678,43 @@ static int stk600_xprog_paged_write(const PROGRAMMER *pgm, const AVRPART *p, con
   }
 
   while(n_bytes != 0) {
+    unsigned int page_remaining = page_size - (addr%page_size);
 
-    if(dynamic_mtype)
-      mtype = stk600_xprog_mtype(pgm, addr - mem->offset);
+    // Boot and application commands must never share a single page commit.
+    if(dynamic_mtype && addr - mem->offset < my.boot_start &&
+        page_remaining > my.boot_start - (addr - mem->offset))
+      page_remaining = my.boot_start - (addr - mem->offset);
 
-    if(page_size > 256) {
-      /*
-       * AVR079 is not quite clear.  While it suggests that downloading up to
-       * 512 bytes (256 words) were OK, it obviously isn't -- 512-byte pages on
-       * the ATxmega128A1 are getting corrupted when written as a single piece.
-       * It writes random junk somewhere beyond byte 256. Splitting it into 256
-       * byte chunks, and only setting the erase page/write page bits in the
-       * final chunk helps.
-       */
-      if(page_size%256 != 0) {
-        pmsg_error("page size not multiple of 256\n");
-        mmt_free(b);
-        return -1;
-      }
-      unsigned int chunk;
+    for(unsigned int chunk = 0; chunk < page_remaining;) {
+      unsigned int count = page_remaining - chunk;
 
-      for(chunk = 0; chunk < page_size; chunk += 256) {
-        if(n_bytes < 256) {
-          memset(b + 9 + n_bytes, 0xff, 256 - n_bytes);
-          writesize = n_bytes;
-        } else {
-          writesize = 256;
-        }
-        b[0] = XPRG_CMD_WRITE_MEM;
-        b[1] = mtype;
-        b[2] = writemode;
-        b[3] = addr >> 24;
-        b[4] = addr >> 16;
-        b[5] = addr >> 8;
-        b[6] = addr;
-        b[7] = 1;
-        b[8] = 0;
-        memcpy(b + 9, mem->buf + offset, writesize);
-        if(stk600_xprog_command(pgm, b, 256 + 9, 2) < 0) {
-          pmsg_error("XPRG_CMD_WRITE_MEM failed\n");
-          mmt_free(b);
-          return -1;
-        }
-        if(n_bytes < 256)
-          n_bytes = 256;
-
-        offset += 256;
-        addr += 256;
-        n_bytes -= 256;
-      }
-    } else {
-      if(n_bytes < page_size) {
-        // This can easily happen if the input file was not a multiple of the page size
-        memset(b + 9 + n_bytes, 0xff, page_size - n_bytes);
-        writesize = n_bytes;
-      } else {
-        writesize = page_size;
-      }
+      if(count > 256)
+        count = 256;
+      writesize = n_bytes < count? n_bytes: count;
+      if(dynamic_mtype)
+        mtype = stk600_xprog_mtype(pgm, addr - mem->offset);
       b[0] = XPRG_CMD_WRITE_MEM;
       b[1] = mtype;
-      b[2] = writemode;
+      // Retain the NVM page buffer across fragments; commit only the last.
+      b[2] = chunk + count == page_remaining? writemode: 0;
       b[3] = addr >> 24;
       b[4] = addr >> 16;
       b[5] = addr >> 8;
       b[6] = addr;
-      b[7] = page_size >> 8;
-      b[8] = page_size;
-      memcpy(b + 9, mem->buf + offset, writesize);
-      if(stk600_xprog_command(pgm, b, page_size + 9, 2) < 0) {
+      b[7] = count >> 8;
+      b[8] = count;
+      memset(b + 9, 0xff, count);
+      if(writesize)
+        memcpy(b + 9, mem->buf + offset, writesize);
+      if(stk600_xprog_command(pgm, b, count + 9, 2) < 0) {
         pmsg_error("XPRG_CMD_WRITE_MEM failed\n");
         mmt_free(b);
         return -1;
       }
-      if(n_bytes < page_size)
-        n_bytes = page_size;
-
-      offset += page_size;
-      addr += page_size;
-      n_bytes -= page_size;
+      offset += writesize;
+      addr += count;
+      n_bytes -= writesize;
+      chunk += count;
     }
   }
   mmt_free(b);

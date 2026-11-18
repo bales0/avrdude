@@ -257,6 +257,7 @@ struct pdata {
   } pgmtype;
 
   int is_scratchmonkey, scratchmonkey_leds;
+  bool xprog_supported; // confirmed by an explicit, non-programming SETMODE probe
 
   // Get/set flags for Xplained Mini SUFFER register
   bool suffer_get;
