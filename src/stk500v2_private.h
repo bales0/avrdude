@@ -302,3 +302,6 @@ struct pdata {
    */
   void *chained_pdata;
 };
+
+// HVprog2 XPROG extension: two-byte target flash page size.
+#define XPRG_PARAM_FLASHPAGESIZE             0x05

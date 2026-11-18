@@ -73,3 +73,6 @@ x86/
 
 # Visual Studio code
 .vscode/
+specification/
+CMakePresets.json
+DEVELOPMENT.md

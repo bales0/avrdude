@@ -1158,6 +1158,7 @@ static int stk500v2_initialize(const PROGRAMMER *pgm, const AVRPART *p) {
   AVRMEM *m;
 
   if((my.pgmtype == PGMTYPE_STK600 ||
+      my.pgmtype == PGMTYPE_STK500 ||
       my.pgmtype == PGMTYPE_AVRISP_MKII ||
       my.pgmtype == PGMTYPE_JTAGICE_MKII) != 0 && (p->prog_modes & (PM_PDI | PM_TPI)) != 0) {
     // This is an ATxmega device, must use XPROG protocol for the remaining actions
@@ -1706,9 +1707,20 @@ static void stk500v2_enable(PROGRAMMER *pgm, const AVRPART *p) {
   // Previously stk500v2_initialize() set up pgm
   if(pgm->initialize == stk500v2_initialize) {
     if((my.pgmtype == PGMTYPE_STK600 ||
+        my.pgmtype == PGMTYPE_STK500 ||
         my.pgmtype == PGMTYPE_AVRISP_MKII ||
         my.pgmtype == PGMTYPE_JTAGICE_MKII) != 0 && (p->prog_modes & (PM_PDI | PM_TPI)) != 0) {
       stk600_setup_xprog(pgm);
+      if(is_tpi(p)) {
+        // Legacy TPI definitions give byte-sized regions a larger page_size.
+        // Use byte callbacks there; rounding a one-byte fuse to a page breaks verify.
+        for(LNODEID ln = lfirst(p->mem); ln; ln = lnext(ln)) {
+          AVRMEM *m = ldata(ln);
+
+          if(m->size > 0 && m->page_size > m->size)
+            m->page_size = 1;
+        }
+      }
     } else {
       stk600_setup_isp(pgm);
     }
@@ -4196,6 +4208,7 @@ static int stk600_xprog_program_enable(const PROGRAMMER *pgm, const AVRPART *p) 
   unsigned int eepagesize = 42;
   unsigned int nvm_base;
   AVRMEM *mem = NULL;
+  AVRMEM *flashmem = NULL;
   int use_tpi;
 
   use_tpi = is_tpi(p) != 0;
@@ -4211,6 +4224,13 @@ static int stk600_xprog_program_enable(const PROGRAMMER *pgm, const AVRPART *p) 
         return -1;
       }
       eepagesize = mem->page_size;
+    }
+    if(my.pgmtype == PGMTYPE_STK500) {
+      flashmem = avr_locate_flash(p);
+      if(!flashmem || flashmem->page_size <= 1) {
+        pmsg_error("no flash page_size parameter for PDI device\n");
+        return -1;
+      }
     }
   }
 
@@ -4279,6 +4299,18 @@ static int stk600_xprog_program_enable(const PROGRAMMER *pgm, const AVRPART *p) 
     }
   }
 
+  // HVprog2 extends XPROG with the target flash page size.
+  if(flashmem) {
+    buf[0] = XPRG_CMD_SET_PARAM;
+    buf[1] = XPRG_PARAM_FLASHPAGESIZE;
+    buf[2] = flashmem->page_size >> 8;
+    buf[3] = flashmem->page_size;
+    if(stk600_xprog_command(pgm, buf, 4, 2) < 0) {
+      pmsg_error("XPRG_CMD_SET_PARAM(XPRG_PARAM_FLASHPAGESIZE) failed\n");
+      return -1;
+    }
+  }
+
   // Read XMEGA chip silicon revision
   if(is_pdi(p)) {
     AVRMEM *m = avr_locate_io(p);
@@ -4307,6 +4339,23 @@ static void stk600_xprog_disable(const PROGRAMMER *pgm) {
   if(stk600_xprog_command(pgm, buf, 1, 2) < 0) {
     pmsg_error("XPRG_CMD_LEAVE_PROGMODE failed\n");
   }
+}
+
+// Erase the TPI configuration section before either byte or paged fuse writes.
+static int stk600_xprog_erase_config(const PROGRAMMER *pgm, const AVRMEM *mem) {
+  unsigned char b[6];
+
+  b[0] = XPRG_CMD_ERASE;
+  b[1] = XPRG_ERASE_CONFIG;
+  b[2] = mem->offset >> 24;
+  b[3] = mem->offset >> 16;
+  b[4] = mem->offset >> 8;
+  b[5] = mem->offset + 1;
+  if(stk600_xprog_command(pgm, b, sizeof b, 2) < 0) {
+    pmsg_error("XPRG_CMD_ERASE(XPRG_ERASE_CONFIG) failed\n");
+    return -1;
+  }
+  return 0;
 }
 
 static int stk600_xprog_write_byte(const PROGRAMMER *pgm, const AVRPART *p, const AVRMEM *mem,
@@ -4351,18 +4400,8 @@ static int stk600_xprog_write_byte(const PROGRAMMER *pgm, const AVRPART *p, cons
   }
   addr += mem->offset;
 
-  if(need_erase) {
-    b[0] = XPRG_CMD_ERASE;
-    b[1] = XPRG_ERASE_CONFIG;
-    b[2] = mem->offset >> 24;
-    b[3] = mem->offset >> 16;
-    b[4] = mem->offset >> 8;
-    b[5] = mem->offset + 1;
-    if(stk600_xprog_command(pgm, b, 6, 2) < 0) {
-      pmsg_error("XPRG_CMD_ERASE(XPRG_ERASE_CONFIG) failed\n");
-      return -1;
-    }
-  }
+  if(need_erase && stk600_xprog_erase_config(pgm, mem) < 0)
+    return -1;
 
   if(is_tpi(p)) {
     /*
@@ -4587,6 +4626,12 @@ static int stk600_xprog_paged_write(const PROGRAMMER *pgm, const AVRPART *p, con
 
   b = mmt_malloc(page_size + 9);
   if(stk500v2_loadaddr(pgm, use_ext_addr) < 0) {
+    mmt_free(b);
+    return -1;
+  }
+
+  if(is_tpi(p) && (mem_is_a_fuse(mem) || mem_is_fuses(mem)) &&
+    stk600_xprog_erase_config(pgm, mem) < 0) {
     mmt_free(b);
     return -1;
   }

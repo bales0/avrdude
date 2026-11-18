@@ -320,58 +320,78 @@ static void pmshorten(char *desc, const char *modes) {
   }
 }
 
+typedef struct {
+  const char *id;
+  PROGRAMMER *pgm;
+} programmer_list_entry;
+
+static int compare_programmer_list_entry(const void *a, const void *b) {
+  const programmer_list_entry *pa = a, *pb = b;
+  int result = strcasecmp(pa->id, pb->id);
+
+  return result? result: strcmp(pa->id, pb->id);
+}
+
 static void list_programmers(FILE *f, const char *prefix, LISTID programmers, int pm) {
-  LNODEID ln1;
-  LNODEID ln2;
+  LNODEID ln1, ln2;
   PROGRAMMER *pgm;
   int maxlen = 0, len;
+  size_t count = 0, index = 0;
   PROGRAMMER *dry = locate_programmer(programmers, "dryrun");
 
-  sort_programmers(programmers);
-
-  // Compute max length of programmer names
+  // Count visible IDs, including aliases, and compute their maximum length.
   for(ln1 = lfirst(programmers); ln1; ln1 = lnext(ln1)) {
     pgm = ldata(ln1);
-    if(!is_programmer(pgm))
-      continue;
-    for(ln2 = lfirst(pgm->id); ln2; ln2 = lnext(ln2))
-      if(!pm || !pgm->prog_modes || (pm & pgm->prog_modes)) {
-        const char *id = ldata(ln2);
-
-        if(*id == 0 || *id == '.')
-          continue;
-        if((len = strlen(id)) > maxlen)
-          maxlen = len;
-      }
-  }
-
-  for(ln1 = lfirst(programmers); ln1; ln1 = lnext(ln1)) {
-    pgm = ldata(ln1);
-    if(!is_programmer(pgm))
+    if(!is_programmer(pgm) || (pm && pgm->prog_modes && !(pm & pgm->prog_modes)))
       continue;
     for(ln2 = lfirst(pgm->id); ln2; ln2 = lnext(ln2)) {
-      // List programmer if pm or prog_modes uninitialised or if they are compatible otherwise
-      if(!pm || !pgm->prog_modes || (pm & pgm->prog_modes)) {
-        const char *id = ldata(ln2);
-        if(*id == 0 || *id == '.')
-          continue;
+      const char *id = ldata(ln2);
 
-        char *desc = mmt_strdup(pgm->desc);
-        const char *strmodes = str_prog_modes(pgm->prog_modes);
-        pmshorten(desc, avr_prog_modes(pm & pgm->prog_modes));
-        if(verbose > 0)
-          fprintf(f, "%s%-*s = %s (%s) [%s:%d]", prefix, maxlen, id, desc,
-            strmodes, pgm->config_file, pgm->lineno);
-        else
-          fprintf(f, "%s%-*s = %s (%s)", prefix, maxlen, id, desc, strmodes);
-        if(pm != ~0 && strchr(strmodes, ' ') && !(dry && pgm->initpgm == dry->initpgm))
-          fprintf(f, " via %s", str_prog_modes(pm & pgm->prog_modes));
-        fprintf(f, "\n");
-
-        mmt_free(desc);
-      }
+      if(*id == 0 || *id == '.')
+        continue;
+      count++;
+      if((len = strlen(id)) > maxlen)
+        maxlen = len;
     }
   }
+  if(!count)
+    return;
+
+  programmer_list_entry *entries = mmt_malloc(count*sizeof *entries);
+
+  for(ln1 = lfirst(programmers); ln1; ln1 = lnext(ln1)) {
+    pgm = ldata(ln1);
+    if(!is_programmer(pgm) || (pm && pgm->prog_modes && !(pm & pgm->prog_modes)))
+      continue;
+    for(ln2 = lfirst(pgm->id); ln2; ln2 = lnext(ln2)) {
+      const char *id = ldata(ln2);
+
+      if(*id == 0 || *id == '.')
+        continue;
+      entries[index].id = id;
+      entries[index++].pgm = pgm;
+    }
+  }
+  // Sort the displayed names themselves, rather than groups of aliases.
+  qsort(entries, count, sizeof *entries, compare_programmer_list_entry);
+  for(index = 0; index < count; index++) {
+    const char *id = entries[index].id;
+    pgm = entries[index].pgm;
+    char *desc = mmt_strdup(pgm->desc);
+    const char *strmodes = str_prog_modes(pgm->prog_modes);
+
+    pmshorten(desc, avr_prog_modes(pm & pgm->prog_modes));
+    if(verbose > 0)
+      fprintf(f, "%s%-*s = %s (%s) [%s:%d]", prefix, maxlen, id, desc,
+        strmodes, pgm->config_file, pgm->lineno);
+    else
+      fprintf(f, "%s%-*s = %s (%s)", prefix, maxlen, id, desc, strmodes);
+    if(pm != ~0 && strchr(strmodes, ' ') && !(dry && pgm->initpgm == dry->initpgm))
+      fprintf(f, " via %s", str_prog_modes(pm & pgm->prog_modes));
+    fprintf(f, "\n");
+    mmt_free(desc);
+  }
+  mmt_free(entries);
 }
 
 static void list_programmer_types_callback(const char *name, const char *desc, void *cookie) {

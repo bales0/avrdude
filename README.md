@@ -20,6 +20,9 @@ The latest version of AVRDUDE is always available here:\
 
 ## Documentation
 
+For a Windows development setup using MSYS2 UCRT64 and CMake presets, see
+[DEVELOPMENT.md](DEVELOPMENT.md).
+
 Documentation for current and previous releases is [on Github Pages](https://avrdudes.github.io/avrdude/). Git main is documented only with the most recent [avrdude.pdf](https://github.com/avrdudes/avrdude/blob/main/avrdude.pdf).
 
 ## Getting AVRDUDE for Windows
