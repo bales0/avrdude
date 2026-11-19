@@ -534,7 +534,7 @@ static int stk500v2_jtagmkII_recv(const PROGRAMMER *pgm, unsigned char *msg, siz
   }
   if((size_t) rv - 1 > maxsize) {
     pmsg_warning("got %u bytes, have only room for %u bytes\n", (unsigned) rv - 1, (unsigned) maxsize);
-    rv = maxsize;
+    rv = maxsize + 1; // Include the one-byte JTAG envelope in the returned length
   }
   switch(jtagmsg[0]) {
   case RSP_SPI_DATA:
@@ -575,7 +575,7 @@ static int stk500v2_jtag3_recv(const PROGRAMMER *pgm, unsigned char *msg, size_t
    */
   if((size_t) rv - 1 > maxsize) {
     pmsg_debug("%s(): got %u bytes, have only room for %u bytes\n", __func__, (unsigned) rv - 1, (unsigned) maxsize);
-    rv = maxsize;
+    rv = maxsize + 1; // Include the one-byte JTAG envelope in the returned length
   }
   if(jtagmsg[0] != SCOPE_AVR_ISP) {
     pmsg_error("message is not AVR ISP: 0x%02x\n", jtagmsg[0]);

@@ -20,6 +20,9 @@ The latest version of AVRDUDE is always available here:\
 
 ## Documentation
 
+For HVprog2 / ScratchMonkey compatibility, profiles and stabilization results, see
+[HVPROG2.md](HVPROG2.md).
+
 For a Windows development setup using MSYS2 UCRT64 and CMake presets, see
 [DEVELOPMENT.md](DEVELOPMENT.md).
 
